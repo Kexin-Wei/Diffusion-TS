@@ -28,18 +28,42 @@ class CONFIGS(Enum):
     FMRI = "fmri"
     MUJOCO = "mujoco"
 
+
 SEED_DEFAULT = 12345
 LOG_FREQUENCY = 100
 TENSORBOARD = False  # flip to True to enable TensorBoard scalar logging
 
+# Smoke test: one short run per GPU to verify the pipeline works end-to-end.
+PAPER_RUNS: dict[int, list[tuple[CONFIGS, int]]] = {
+    5: [(CONFIGS.ENERGY, 24)],
+    6: [(CONFIGS.MUJOCO, 24)],
+    7: [(CONFIGS.ETT_H, 24)],
+}
+
 # Paper sweep — sequence lengths follow train_one.py's docstring. Allocation is
 # longest-job-first (LPT) across GPUs 5/6/7: ENERGY/256 anchors GPU 5,
 # heavy ETT_H runs cluster on GPU 7.
-PAPER_RUNS: dict[int, list[tuple[CONFIGS, int]]] = {
-    5: [(CONFIGS.ENERGY, 256), (CONFIGS.ENERGY, 24), (CONFIGS.MUJOCO, 24), (CONFIGS.STOCKS, 24)],
-    6: [(CONFIGS.ENERGY, 128), (CONFIGS.MUJOCO, 100), (CONFIGS.FMRI, 24), (CONFIGS.ETT_H, 64)],
-    7: [(CONFIGS.ETT_H, 256), (CONFIGS.ENERGY, 64), (CONFIGS.ETT_H, 128), (CONFIGS.ETT_H, 24), (CONFIGS.SINES, 24)],
-}
+# PAPER_RUNS: dict[int, list[tuple[CONFIGS, int]]] = {
+#     5: [
+#         (CONFIGS.ENERGY, 256),
+#         (CONFIGS.ENERGY, 24),
+#         (CONFIGS.MUJOCO, 24),
+#         (CONFIGS.STOCKS, 24),
+#     ],
+#     6: [
+#         (CONFIGS.ENERGY, 128),
+#         (CONFIGS.MUJOCO, 100),
+#         (CONFIGS.FMRI, 24),
+#         (CONFIGS.ETT_H, 64),
+#     ],
+#     7: [
+#         (CONFIGS.ETT_H, 256),
+#         (CONFIGS.ENERGY, 64),
+#         (CONFIGS.ETT_H, 128),
+#         (CONFIGS.ETT_H, 24),
+#         (CONFIGS.SINES, 24),
+#     ],
+# }
 
 
 def _run_worker(gpu: int) -> None:
