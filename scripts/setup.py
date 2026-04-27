@@ -17,23 +17,6 @@ def ensure_dirs() -> None:
     PID_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def check_setup(runs: list[str], known: dict[str, int]) -> int:
-    """Return 0 if venv + requested datasets + their configs are all present."""
-    if not PY.exists():
-        print(f"venv python not found: {PY}", file=sys.stderr)
-        return 2
-    unknown = [c for c in runs if c not in known]
-    if unknown:
-        print(f"unknown dataset(s): {unknown}", file=sys.stderr)
-        return 2
-    for cfg in runs:
-        yaml = DTS / "Config" / f"{cfg}.yaml"
-        if not yaml.exists():
-            print(f"missing config: {yaml}", file=sys.stderr)
-            return 2
-    return 0
-
-
 def launch_bg(name: str, cmd: list[str], gpu: int) -> int | None:
     """Run cmd detached, one GPU visible via CUDA_VISIBLE_DEVICES.
     Writes logs/{name}.log and logs/pids/{name}.pid. Returns pid or None."""

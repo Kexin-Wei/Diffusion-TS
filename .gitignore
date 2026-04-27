@@ -167,3 +167,4 @@ OUTPUT/
 logs/
 Data/datasets/
 toy_exp/
+checkpoints/

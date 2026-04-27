@@ -11,21 +11,45 @@ from Utils.masking_utils import noise_mask
 
 
 class CustomDataset(Dataset):
+    """Sliding-window Dataset for one 2D time series of shape (T, D).
+
+    `__init__` does five things, in order:
+      1. `read_data(data_root, name)` → loads a single .csv into a (T, D)
+         numpy array + fits a MinMaxScaler.
+      2. `__normalize` → applies the scaler, optionally maps to [-1, 1].
+      3. `__getsamples` → slides a window of length `self.window` across the
+         T-step series → produces T - window + 1 overlapping (window, D)
+         samples; saves them as .npy for evaluation.
+      4. `divide` → splits samples by `proportion`. Note: `id_rdm = np.arange(size)`,
+         so the split is contiguous, not random — first proportion goes to train,
+         the rest to test.
+      5. `__getitem__` returns one (window, D) float32 tensor for train, or
+         (x, mask) for test imputation/forecasting.
+
+    Does NOT handle 3D inputs (N, T, D) — multiple separate series. For those:
+      - flatten to (N*T, D) only if treating concatenated series as one stream
+        is acceptable (boundary windows will mix series — usually undesirable),
+      - OR subclass and override `read_data` + `__getsamples` to slide within
+        each of the N series independently and concatenate the windows,
+      - OR write a fresh Dataset that just yields pre-segmented (window, D)
+        slices and skip the sliding entirely.
+    """
+
     def __init__(
-        self, 
+        self,
         name,
-        data_root, 
-        window=64, 
-        proportion=0.8, 
-        save2npy=True, 
+        data_root,
+        window=64,
+        proportion=0.8,
+        save2npy=True,
         neg_one_to_one=True,
         seed=123,
         period='train',
         output_dir='./OUTPUT',
         predict_length=None,
         missing_ratio=None,
-        style='separate', 
-        distribution='geometric', 
+        style='separate',
+        distribution='geometric',
         mean_mask_length=3
     ):
         super(CustomDataset, self).__init__()
