@@ -44,10 +44,6 @@ from Utils.io_utils import (
 )
 
 
-SEED_DEFAULT = 12345
-LOG_FREQUENCY = 100
-
-
 def cycle(dl):
     """Yield batches forever so the step-based training loop never exhausts.
 
@@ -63,8 +59,9 @@ def train_one(
     cfg: str,
     gpu: int,
     seq_length: int | None = None,
-    seed: int = SEED_DEFAULT,
+    seed: int = 12345,
     tensorboard: bool = False,
+    log_frequency: int = 100,
     output: str = "OUTPUT",
 ) -> None:
     """Train one dataset end-to-end — inlines main.py setup + unfolds Trainer."""
@@ -192,7 +189,7 @@ def train_one(
                         ckpt_path,
                     )
 
-                if step % LOG_FREQUENCY == 0:
+                if step % log_frequency == 0:
                     logger.add_scalar(
                         tag="train/loss",
                         scalar_value=total_loss,
@@ -210,6 +207,7 @@ if __name__ == "__main__":
         cfg="energy",
         gpu=0,
         seq_length=24,
-        seed=SEED_DEFAULT,
+        seed=12345,
+        log_frequency=100,
         tensorboard=False,
     )

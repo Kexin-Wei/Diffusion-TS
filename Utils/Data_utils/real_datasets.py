@@ -117,7 +117,7 @@ class CustomDataset(Dataset):
     def unnormalize(self, sq):
         d = self.__unnormalize(sq.reshape(-1, self.var_num))
         return d.reshape(-1, self.window, self.var_num)
-    
+
     def __normalize(self, rawdata):
         data = self.scaler.transform(rawdata)
         if self.auto_norm:
@@ -129,7 +129,7 @@ class CustomDataset(Dataset):
             data = unnormalize_to_zero_to_one(data)
         x = data
         return self.scaler.inverse_transform(x)
-    
+
     @staticmethod
     def divide(data, ratio, seed=2023):
         size = data.shape[0]
@@ -161,7 +161,7 @@ class CustomDataset(Dataset):
         scaler = MinMaxScaler()
         scaler = scaler.fit(data)
         return data, scaler
-    
+
     def mask_data(self, seed=2023):
         masks = np.ones_like(self.samples)
         # Store the state of the RNG to restore later.
@@ -191,7 +191,6 @@ class CustomDataset(Dataset):
 
     def __len__(self):
         return self.sample_num
-    
 
 class fMRIDataset(CustomDataset):
     def __init__(
@@ -208,4 +207,27 @@ class fMRIDataset(CustomDataset):
         data = io.loadmat(filepath + '/sim4.mat')['ts']
         scaler = MinMaxScaler()
         scaler = scaler.fit(data)
+        return data, scaler
+
+
+class Simglucose1MDataset(CustomDataset):
+    """1-meal simglucose data, flattened across patients (strategy a).
+
+    Source array is (30, 1450, 22) = (patients, timesteps, features).
+    We reshape to (30*1450, 22) so the parent's 2D sliding window can run;
+    ~30 of ~43.5k windows cross a patient boundary — acceptable for prototyping.
+    """
+
+    SOURCE_FILE = "onemeal_24h.npy"  # swap to "threemeal_24h.npy" if needed
+
+    def __init__(self, proportion=1.0, **kwargs):
+        super().__init__(proportion=proportion, **kwargs)
+
+    @classmethod
+    def read_data(cls, filepath, name=""):
+        arr = np.load(os.path.join(filepath, cls.SOURCE_FILE))
+        data = arr.reshape(
+            -1, arr.shape[-1]
+        )  # flatten patients and timesteps to (30*1450, 22)
+        scaler = MinMaxScaler().fit(data)
         return data, scaler

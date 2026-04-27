@@ -17,7 +17,7 @@ import sys
 from enum import Enum
 from pathlib import Path
 
-from train_one import SEED_DEFAULT, train_one
+from train_one import train_one
 
 
 class CONFIGS(Enum):
@@ -28,7 +28,8 @@ class CONFIGS(Enum):
     FMRI = "fmri"
     MUJOCO = "mujoco"
 
-
+SEED_DEFAULT = 12345
+LOG_FREQUENCY = 100
 TENSORBOARD = False  # flip to True to enable TensorBoard scalar logging
 
 # Paper sweep — sequence lengths follow train_one.py's docstring. Allocation is
@@ -59,6 +60,7 @@ def _run_worker(gpu: int) -> None:
             gpu,
             seq_length=seq_length,
             seed=SEED_DEFAULT,
+            log_frequency=LOG_FREQUENCY,
             tensorboard=TENSORBOARD,
         )
 
