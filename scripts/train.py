@@ -62,19 +62,14 @@ SEED_DEFAULT = 12345
 LOG_FREQUENCY = 100
 TENSORBOARD = False  # flip to True to enable TensorBoard scalar logging
 
-# SMOKE TEST: one short run per GPU, validates parent/worker wiring + log routing.
-# Restore the full paper sweep below once this passes.
+# Paper sweep — sequence lengths follow the docstring above. Allocation is
+# longest-job-first (LPT) across GPUs 5/6/7: ENERGY/256 anchors GPU 5,
+# heavy ETT_H runs cluster on GPU 7.
 PAPER_RUNS: dict[int, list[tuple[CONFIGS, int]]] = {
-    5: [(CONFIGS.SINES, 24)],
-    6: [(CONFIGS.STOCKS, 24)],
-    7: [(CONFIGS.MUJOCO, 24)],
+    5: [(CONFIGS.ENERGY, 256), (CONFIGS.ENERGY, 24), (CONFIGS.MUJOCO, 24), (CONFIGS.STOCKS, 24)],
+    6: [(CONFIGS.ENERGY, 128), (CONFIGS.MUJOCO, 100), (CONFIGS.FMRI, 24), (CONFIGS.ETT_H, 64)],
+    7: [(CONFIGS.ETT_H, 256), (CONFIGS.ENERGY, 64), (CONFIGS.ETT_H, 128), (CONFIGS.ETT_H, 24), (CONFIGS.SINES, 24)],
 }
-# Full paper sweep (uncomment when smoke test passes; smoke trim above takes precedence):
-# PAPER_RUNS: dict[int, list[tuple[CONFIGS, int]]] = {
-#     5: [(CONFIGS.ENERGY, 256), (CONFIGS.ENERGY, 24), (CONFIGS.MUJOCO, 24), (CONFIGS.STOCKS, 24)],
-#     6: [(CONFIGS.ENERGY, 128), (CONFIGS.MUJOCO, 100), (CONFIGS.FMRI, 24), (CONFIGS.ETT_H, 64)],
-#     7: [(CONFIGS.ETT_H, 256), (CONFIGS.ENERGY, 64), (CONFIGS.ETT_H, 128), (CONFIGS.ETT_H, 24), (CONFIGS.SINES, 24)],
-# }2 m
 
 
 def cycle(dl):
@@ -91,7 +86,7 @@ def cycle(dl):
 def train_one(
     cfg: str,
     gpu: int,
-    seq_length: int = None,
+    seq_length: int | None = None,
     seed: int = SEED_DEFAULT,
     tensorboard: bool = False,
     output: str = "OUTPUT",
@@ -134,7 +129,9 @@ def train_one(
     logger = Logger(args)
     logger.save_config(config)
 
-    model = instantiate_from_config(config["model"]).cuda()
+    model = instantiate_from_config(config["model"])
+    assert model is not None, f"model config in {config_file} is missing 'target'"
+    model = model.cuda()
 
     dataloader_bundle = build_dataloader(config, args)
 
@@ -144,7 +141,7 @@ def train_one(
     opt = Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=base_lr,
-        betas=[0.9, 0.96],
+        betas=(0.9, 0.96),
     )
 
     ema_decay = config["solver"]["ema"]["decay"]
@@ -156,6 +153,7 @@ def train_one(
     sc_cfg = config["solver"]["scheduler"]
     sc_cfg["params"]["optimizer"] = opt
     sch = instantiate_from_config(sc_cfg)
+    assert sch is not None, f"scheduler config in {config_file} is missing 'target'"
 
     logger.log_info(str(get_model_parameters_info(model)))
 
