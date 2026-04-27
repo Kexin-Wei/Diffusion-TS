@@ -14,7 +14,7 @@ model:
     mlp_hidden_times: 4
     attn_pd: 0.0
     resid_pd: 0.0
-    kernel_size: 5
+    kernel_size: 1
     padding_size: 0
 
 solver:

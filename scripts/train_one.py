@@ -79,6 +79,12 @@ def train_one(
     config["dataloader"]["train_dataset"]["params"]["window"] = seq_length
     config["dataloader"]["test_dataset"]["params"]["window"] = seq_length
 
+    # Drop YAML kernel/padding so the model auto-picks based on (n_feat, seq_length).
+    # Required when seq_length is overridden — a YAML pair tuned for one length
+    # silently violates p=(k-1)//2 (or just diverges from the heuristic) at another.
+    config["model"]["params"].pop("kernel_size", None)
+    config["model"]["params"].pop("padding_size", None)
+
     # Centralise checkpoints under ./checkpoints/<cfg>_seq_<N>/ — folder name is
     # always self-describing, no matter whether seq_length came from YAML or caller.
     results_folder = Path("checkpoints") / f"{cfg}_seq_{seq_length}"
