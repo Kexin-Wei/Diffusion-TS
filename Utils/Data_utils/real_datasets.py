@@ -231,3 +231,26 @@ class Simglucose1MDataset(CustomDataset):
         )  # flatten patients and timesteps to (30*1450, 22)
         scaler = MinMaxScaler().fit(data)
         return data, scaler
+
+
+class Simglucose3MDataset(CustomDataset):
+    """3-meal simglucose data, flattened across patients (strategy a).
+
+    Source array is (30, 1450, 22) = (patients, timesteps, features).
+    We reshape to (30*1450, 22) so the parent's 2D sliding window can run;
+    ~30 of ~43.5k windows cross a patient boundary — acceptable for prototyping.
+    """
+
+    SOURCE_FILE = "threemeal_24h.npy"
+
+    def __init__(self, proportion=1.0, **kwargs):
+        super().__init__(proportion=proportion, **kwargs)
+
+    @classmethod
+    def read_data(cls, filepath, name=""):
+        arr = np.load(os.path.join(filepath, cls.SOURCE_FILE))
+        data = arr.reshape(
+            -1, arr.shape[-1]
+        )  # flatten patients and timesteps to (30*1450, 22)
+        scaler = MinMaxScaler().fit(data)
+        return data, scaler
