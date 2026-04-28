@@ -8,13 +8,12 @@ top-to-bottom. The diffusion model itself stays opaque
 (`instantiate_from_config(config['model'])`).
 
 Run from the Diffusion-TS directory:
-  python scripts/forecasting.py --only etth                     # default horizon
-  python scripts/forecasting.py --only etth --pred-lens 24 96
-  python scripts/forecasting.py --only etth --milestone 10
-  python scripts/forecasting.py --only etth --gpu 0
+  ./Diffusion-TS/.venv/bin/python scripts/forecasting_one.py   # uses __main__ defaults
 
-In-process can only run one dataset per invocation. Output:
-  OUTPUT/<cfg>/ddpm_predict_<cfg>_h{pred_len}.npy
+This module exposes `forecast_one(...)` plus the small helpers it needs. It does
+NOT orchestrate multi-GPU runs — that lives in `forecasting_reproduce.py`.
+
+Output: OUTPUT/<cfg>/ddpm_predict_<cfg>_h{pred_len}.npy
 
 READING (the source this script unfolds):
   main.py:54-95              — top-level dispatch
@@ -34,16 +33,9 @@ READING (the source this script unfolds):
 """
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
-
-# Make the Diffusion-TS root importable when run directly.
-_DTS = Path(__file__).resolve().parent.parent
-if str(_DTS) not in sys.path:
-    sys.path.insert(0, str(_DTS))
 
 import numpy as np
 import torch
@@ -58,10 +50,6 @@ from Utils.io_utils import (
 )
 
 
-GPU_OF: dict[str, int] = {
-    "sines": 0, "stocks": 3, "etth": 4,
-    "energy": 5, "fmri": 6, "mujoco": 2,
-}
 PRED_LENS_DEFAULT: tuple[int, ...] = (24,)
 MILESTONE_DEFAULT = 10
 SEED_DEFAULT = 12345
@@ -72,17 +60,17 @@ def build_cond_dataloader(config: dict, args: SimpleNamespace):
     mode='predict' branch (build_dataloader.py:26-48). Returns
     (dataloader, dataset)."""
     # STEP A: pick batch size + inject save_dir into the dataset params.
-    batch_size = config['dataloader']['sample_size']
-    config['dataloader']['test_dataset']['params']['output_dir'] = args.save_dir
+    batch_size = config["dataloader"]["sample_size"]
+    config["dataloader"]["test_dataset"]["params"]["output_dir"] = args.save_dir
 
     # STEP B: dispatch on mode — for predict we set predict_length; the
     # dataset zeroes the last `pred_len` timesteps in the mask
     # (build_dataloader.py:31-32).
-    config['dataloader']['test_dataset']['params']['predict_length'] = args.pred_len
+    config["dataloader"]["test_dataset"]["params"]["predict_length"] = args.pred_len
 
     # STEP C: instantiate dataset, wrap in DataLoader (no shuffle so
     # outputs line up with reals; drop_last=False so we don't lose tail samples).
-    dataset = instantiate_from_config(config['dataloader']['test_dataset'])
+    dataset = instantiate_from_config(config["dataloader"]["test_dataset"])
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -119,9 +107,9 @@ def forecast_one(
         tensorboard=False,
         seed=seed,
         gpu=gpu,
-        mode='predict',
+        mode="predict",
         missing_ratio=0.0,
-        pred_len=0,          # overwritten per-horizon below
+        pred_len=0,  # overwritten per-horizon below
     )
 
     # ============================================================
@@ -144,7 +132,7 @@ def forecast_one(
     # ============================================================
     # STEP 5: build the diffusion model (only opaque step).
     # ============================================================
-    model = instantiate_from_config(config['model']).cuda()
+    model = instantiate_from_config(config["model"]).cuda()
     device = model.betas.device
 
     # ============================================================
@@ -172,15 +160,17 @@ def forecast_one(
     #   model.load_state_dict(data['model'])
     #   ema.load_state_dict(data['ema'])
     # ============================================================
-    raise NotImplementedError("STEP 7: torch.load checkpoint, restore model + ema state_dicts")
+    raise NotImplementedError(
+        "STEP 7: torch.load checkpoint, restore model + ema state_dicts"
+    )
 
     # ============================================================
     # STEP 8: read the three test-time sampling params (main.py:80-82).
     # ============================================================
-    coef = config['dataloader']['test_dataset']['coefficient']
-    stepsize = config['dataloader']['test_dataset']['step_size']
-    sampling_steps = config['dataloader']['test_dataset']['sampling_steps']
-    model_kwargs = {'coef': coef, 'learning_rate': stepsize}
+    coef = config["dataloader"]["test_dataset"]["coefficient"]
+    stepsize = config["dataloader"]["test_dataset"]["step_size"]
+    sampling_steps = config["dataloader"]["test_dataset"]["sampling_steps"]
+    model_kwargs = {"coef": coef, "learning_rate": stepsize}
 
     # ============================================================
     # STEP 9: per-horizon sweep.
@@ -218,7 +208,9 @@ def forecast_one(
         #           )
         #       samples = np.row_stack([samples, sample.detach().cpu().numpy()])
         # --------------------------------------------------------
-        raise NotImplementedError("STEP 10: per-batch sampling loop over the cond dataloader")
+        raise NotImplementedError(
+            "STEP 10: per-batch sampling loop over the cond dataloader"
+        )
 
         # --------------------------------------------------------
         # STEP 11: rescale [-1,1] → [0,1] when the dataset normalised
@@ -236,34 +228,11 @@ def forecast_one(
         logger.log_info(f"[{cfg}] pred_len={L} -> {out_path} (shape={samples.shape})")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument(
-        "--only", metavar="DATASET", required=True,
-        help=f"dataset to forecast; one of: {', '.join(GPU_OF)}",
-    )
-    ap.add_argument(
-        "--pred-lens", type=int, nargs="+", default=list(PRED_LENS_DEFAULT),
-        metavar="L", help="prediction horizons to sweep (default: 24)",
-    )
-    ap.add_argument(
-        "--milestone", type=int, default=MILESTONE_DEFAULT,
-        help="checkpoint milestone to load (default: 10 = final)",
-    )
-    ap.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    ap.add_argument("--gpu", type=int, default=None,
-                    help="override GPU_OF[<dataset>]")
-    args = ap.parse_args()
-
-    if args.only not in GPU_OF:
-        print(f"error: unknown dataset {args.only!r}; choices: {', '.join(GPU_OF)}",
-              file=sys.stderr)
-        return 2
-
-    gpu = args.gpu if args.gpu is not None else GPU_OF[args.only]
-    forecast_one(args.only, gpu, args.seed, args.milestone, args.pred_lens)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    forecast_one(
+        cfg="etth",
+        gpu=0,
+        seed=SEED_DEFAULT,
+        milestone=MILESTONE_DEFAULT,
+        pred_lens=list(PRED_LENS_DEFAULT),
+    )
