@@ -35,7 +35,6 @@ from torch.nn.utils import clip_grad_norm_
 from tqdm.auto import tqdm
 
 from engine.logger import Logger
-from Data.build_dataloader import build_dataloader
 from Utils.io_utils import (
     load_yaml_config,
     seed_everything,
@@ -53,6 +52,27 @@ def cycle(dl):
     while True:
         for data in dl:
             yield data
+
+
+def build_dataloader(config, args=None):
+    batch_size = config["dataloader"]["batch_size"]
+    jud = config["dataloader"]["shuffle"]
+    config["dataloader"]["train_dataset"]["params"]["output_dir"] = args.save_dir
+    dataset = instantiate_from_config(config["dataloader"]["train_dataset"])
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=jud,
+        num_workers=0,
+        pin_memory=True,
+        sampler=None,
+        drop_last=jud,
+    )
+
+    dataload_info = {"dataloader": dataloader, "dataset": dataset}
+
+    return dataload_info
 
 
 def train_one(

@@ -27,7 +27,7 @@ from __future__ import annotations
 from train_one import train_one
 
 
-SMOKE = True  # flip to False after the smoke run looks healthy
+SMOKE = False  # flip to False after the smoke run looks healthy
 GPU = 0
 
 
