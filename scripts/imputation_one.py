@@ -8,13 +8,12 @@ top-to-bottom. The diffusion model itself stays opaque
 (`instantiate_from_config(config['model'])`).
 
 Run from the Diffusion-TS directory:
-  python scripts/imputation.py --only etth                       # default ratios
-  python scripts/imputation.py --only etth --ratios 0.7 0.8 0.9
-  python scripts/imputation.py --only etth --milestone 10
-  python scripts/imputation.py --only etth --gpu 0
+  ./Diffusion-TS/.venv/bin/python scripts/imputation_one.py    # uses __main__ defaults
 
-In-process can only run one dataset per invocation. Output:
-  OUTPUT/<cfg>/ddpm_infill_<cfg>_m{70,80,90}.npy
+This module exposes `impute_one(...)` plus the small helpers it needs. It does
+NOT orchestrate multi-GPU runs — that lives in `imputation_reproduce.py`.
+
+Output: OUTPUT/<cfg>/ddpm_infill_<cfg>_m{70,80,90}.npy
 
 READING (the source this script unfolds):
   main.py:54-95              — top-level dispatch
@@ -32,16 +31,9 @@ READING (the source this script unfolds):
 """
 from __future__ import annotations
 
-import argparse
 import os
-import sys
 from pathlib import Path
 from types import SimpleNamespace
-
-# Make the Diffusion-TS root importable when run directly.
-_DTS = Path(__file__).resolve().parent.parent
-if str(_DTS) not in sys.path:
-    sys.path.insert(0, str(_DTS))
 
 import numpy as np
 import torch
@@ -56,10 +48,6 @@ from Utils.io_utils import (
 )
 
 
-GPU_OF: dict[str, int] = {
-    "sines": 0, "stocks": 3, "etth": 4,
-    "energy": 5, "fmri": 6, "mujoco": 2,
-}
 MISSING_RATIOS_DEFAULT: tuple[float, ...] = (0.7, 0.8, 0.9)
 MILESTONE_DEFAULT = 10
 SEED_DEFAULT = 12345
@@ -238,34 +226,11 @@ def impute_one(
         logger.log_info(f"[{cfg}] ratio={r} -> {out_path} (shape={samples.shape})")
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument(
-        "--only", metavar="DATASET", required=True,
-        help=f"dataset to impute; one of: {', '.join(GPU_OF)}",
-    )
-    ap.add_argument(
-        "--ratios", type=float, nargs="+", default=list(MISSING_RATIOS_DEFAULT),
-        metavar="R", help="missing ratios to sweep (default: 0.7 0.8 0.9)",
-    )
-    ap.add_argument(
-        "--milestone", type=int, default=MILESTONE_DEFAULT,
-        help="checkpoint milestone to load (default: 10 = final)",
-    )
-    ap.add_argument("--seed", type=int, default=SEED_DEFAULT)
-    ap.add_argument("--gpu", type=int, default=None,
-                    help="override GPU_OF[<dataset>]")
-    args = ap.parse_args()
-
-    if args.only not in GPU_OF:
-        print(f"error: unknown dataset {args.only!r}; choices: {', '.join(GPU_OF)}",
-              file=sys.stderr)
-        return 2
-
-    gpu = args.gpu if args.gpu is not None else GPU_OF[args.only]
-    impute_one(args.only, gpu, args.seed, args.milestone, args.ratios)
-    return 0
-
-
 if __name__ == "__main__":
-    sys.exit(main())
+    impute_one(
+        cfg="etth",
+        gpu=0,
+        seed=SEED_DEFAULT,
+        milestone=MILESTONE_DEFAULT,
+        ratios=list(MISSING_RATIOS_DEFAULT),
+    )
