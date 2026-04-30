@@ -209,7 +209,8 @@ class fMRIDataset(CustomDataset):
         scaler = scaler.fit(data)
         return data, scaler
 
-
+'''
+decrapted as not real data
 class Simglucose1MDataset(CustomDataset):
     """1-meal simglucose data, flattened across patients (strategy a).
 
@@ -254,3 +255,4 @@ class Simglucose3MDataset(CustomDataset):
         )  # flatten patients and timesteps to (30*1450, 22)
         scaler = MinMaxScaler().fit(data)
         return data, scaler
+'''

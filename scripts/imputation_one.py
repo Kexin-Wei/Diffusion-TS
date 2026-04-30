@@ -1,73 +1,72 @@
 #!/usr/bin/env python3
-"""Run Diffusion-TS imputation on one benchmark dataset, in-process.
+"""Pure single-dataset Diffusion-TS imputer — importable library.
 
 Dismantled version of `python main.py --sample 1 --mode infill …` —
 inlines main.py's setup AND unfolds Trainer.__init__ + Trainer.load +
 Trainer.restore so the full conditional-sampling pipeline is visible
-top-to-bottom. The diffusion model itself stays opaque
-(`instantiate_from_config(config['model'])`).
+top-to-bottom in one file. Only `instantiate_from_config(config['model'])`
+stays opaque (the diffusion model itself).
 
-Run from the Diffusion-TS directory:
-  ./Diffusion-TS/.venv/bin/python scripts/imputation_one.py    # uses __main__ defaults
+This module exposes `impute_one(...)` plus the small helpers it needs. It
+does NOT orchestrate multi-GPU runs — that lives in `imputation_reproduce.py`.
 
-This module exposes `impute_one(...)` plus the small helpers it needs. It does
-NOT orchestrate multi-GPU runs — that lives in `imputation_reproduce.py`.
+Outputs (per missing ratio r), under OUTPUT/<cfg>_seq_<N>/:
+  ddpm_infill_<run>_m{int(r*100)}.npy   — samples, original units
+  reals_<run>_m{int(r*100)}.npy         — ground truth, original units
+  masks_<run>_m{int(r*100)}.npy         — bool mask (True=observed, False=target)
+  impute_<run>_m{int(r*100)}.png        — Tutorial_1-style observed/target/imputation plot
+  metrics_<run>.json                    — per-ratio MSE/MAE on masked positions
 
-Output: OUTPUT/<cfg>/ddpm_infill_<cfg>_m{70,80,90}.npy
-
-READING (the source this script unfolds):
-  main.py:54-95              — top-level dispatch
-  main.py:77-87              — sample==1 conditional branch (load → restore → save)
-  Data/build_dataloader.py:26-48 — build_dataloader_cond:
-                                injects missing_ratio for mode='infill'
-                                or predict_length for mode='predict'
-  engine/solver.py:25-55     — Trainer.__init__: builds EMA wrapper
-                                (we need ema.ema_model to sample)
-  engine/solver.py:77-86     — Trainer.load: torch.load + state_dict restore
-  engine/solver.py:162-188   — Trainer.restore: per-batch sample_infill loop
+READING (source this script unfolds):
+  main.py:54-95                  — top-level dispatch
+  main.py:77-87                  — sample==1 branch (load → restore → save)
+  Data/build_dataloader.py:26-48 — build_dataloader_cond (missing_ratio branch)
+  engine/solver.py:25-55, 77-86  — Trainer.__init__ + Trainer.load
+  engine/solver.py:162-188       — Trainer.restore (per-batch sample_infill loop)
   Models/interpretable_diffusion/* — sample_infill / fast_sample_infill (opaque)
-  Config/etth.yaml:dataloader.test_dataset.{coefficient,step_size,sampling_steps}
-                                 — Yuan & Qiao 2024 §B.3 + Table 6
+  Config/<name>.yaml             — solver + dataloader blocks
+  Tutorial_1.ipynb               — imputation marker style reference
 """
 from __future__ import annotations
 
+import json
 import os
-from pathlib import Path
 from types import SimpleNamespace
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from ema_pytorch import EMA
 
 from engine.logger import Logger
-from Models.interpretable_diffusion.model_utils import unnormalize_to_zero_to_one
 from Utils.io_utils import (
     load_yaml_config,
     seed_everything,
     instantiate_from_config,
 )
 
+from scripts.utils import get_results_folder
+
 
 MISSING_RATIOS_DEFAULT: tuple[float, ...] = (0.7, 0.8, 0.9)
 MILESTONE_DEFAULT = 10
 SEED_DEFAULT = 12345
+SEQ_LENGTH_DEFAULT = 64
 
 
 def build_cond_dataloader(config: dict, args: SimpleNamespace):
-    """Unfolded Data.build_dataloader.build_dataloader_cond — only the
-    mode='infill' branch (build_dataloader.py:26-48). Returns
-    (dataloader, dataset)."""
-    # STEP A: pick batch size + inject save_dir into the dataset params.
-    batch_size = config['dataloader']['sample_size']
-    config['dataloader']['test_dataset']['params']['output_dir'] = args.save_dir
+    """Unfolded Data.build_dataloader.build_dataloader_cond — infill-mode
+    branch only. Sets missing_ratio on the test dataset (which builds a
+    random mask), then wraps in a deterministic, no-shuffle DataLoader so
+    output rows align with reals."""
+    batch_size = config["dataloader"]["sample_size"]
+    config["dataloader"]["test_dataset"]["params"]["output_dir"] = args.save_dir
+    config["dataloader"]["test_dataset"]["params"]["missing_ratio"] = args.missing_ratio
 
-    # STEP B: dispatch on mode — for infill we set missing_ratio; the
-    # dataset's __init__ uses it to build a random mask (build_dataloader.py:29-30).
-    config['dataloader']['test_dataset']['params']['missing_ratio'] = args.missing_ratio
-
-    # STEP C: instantiate dataset, wrap in DataLoader (no shuffle so
-    # outputs line up with reals; drop_last=False so we don't lose tail samples).
-    dataset = instantiate_from_config(config['dataloader']['test_dataset'])
+    dataset = instantiate_from_config(config["dataloader"]["test_dataset"])
     dataloader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,
@@ -86,144 +85,198 @@ def impute_one(
     seed: int,
     milestone: int,
     ratios: list[float],
+    seq_length: int,
     output: str = "OUTPUT",
+    n_plot_samples: int = 5,
+    n_plot_features: int = 4,
 ) -> None:
-    """Imputation pipeline, fully unfolded. One model load, then one
-    sampling sweep per missing ratio."""
+    """Impute one dataset end-to-end — inlines main.py setup + unfolds Trainer."""
 
-    # ============================================================
-    # STEP 1: args namespace expected by Logger / dataloader builder.
-    # ============================================================
     config_file = f"Config/{cfg}.yaml"
-    save_dir = os.path.join(output, cfg)
+    run_name = f"{cfg}_seq_{seq_length}"
+    save_dir = os.path.join(output, run_name)
     args = SimpleNamespace(
-        name=cfg,
+        name=run_name,
         config_file=config_file,
         output=output,
         save_dir=save_dir,
         tensorboard=False,
         seed=seed,
         gpu=gpu,
-        mode='infill',
-        missing_ratio=0.0,   # overwritten per-ratio below
+        mode="infill",
+        missing_ratio=0.0,  # overwritten per-ratio in the sweep below
         pred_len=0,
     )
 
-    # ============================================================
-    # STEP 2: determinism + GPU pin (main.py:57-61).
-    # ============================================================
     seed_everything(seed)
     torch.cuda.set_device(gpu)
 
-    # ============================================================
-    # STEP 3: load YAML config (main.py:63).
-    # ============================================================
     config = load_yaml_config(config_file)
 
-    # ============================================================
-    # STEP 4: Logger (writes save_dir/configs/*, save_dir/logs/*).
-    # ============================================================
+    # Propagate seq_length into model + dataloader (mirrors train_one.py:99-107).
+    # Required so the model arch + dataset window match the trained checkpoint;
+    # otherwise the state_dict load below silently mismatches conv kernels.
+    config["model"]["params"]["seq_length"] = seq_length
+    config["dataloader"]["test_dataset"]["params"]["window"] = seq_length
+    if "train_dataset" in config["dataloader"]:
+        config["dataloader"]["train_dataset"]["params"]["window"] = seq_length
+
+    # Drop YAML kernel/padding so the model auto-picks based on (n_feat, seq_length).
+    # Required when seq_length is overridden — a YAML pair tuned for one length
+    # silently violates p=(k-1)//2 (or just diverges from the heuristic) at another.
+    config["model"]["params"].pop("kernel_size", None)
+    config["model"]["params"].pop("padding_size", None)
+
+    results_folder = get_results_folder(config, cfg, seq_length)
+    config["solver"]["results_folder"] = results_folder
+
     logger = Logger(args)
     logger.save_config(config)
 
-    # ============================================================
-    # STEP 5: build the diffusion model (only opaque step).
-    # ============================================================
-    model = instantiate_from_config(config['model']).cuda()
+    model = instantiate_from_config(config["model"]).cuda()
     device = model.betas.device
 
-    # ============================================================
-    # STEP 6 (TODO): build the EMA wrapper.
-    # We're not training, but Trainer.restore samples from `ema.ema_model`
-    # (solver.py:176, 179), so the EMA wrapper has to exist to receive
-    # the EMA weights from the checkpoint.
-    #
-    # Hint:
-    #   ema_decay = config['solver']['ema']['decay']
-    #   ema_update_every = config['solver']['ema']['update_interval']
-    #   ema = EMA(model, beta=ema_decay, update_every=ema_update_every).to(device)
-    # ============================================================
-    raise NotImplementedError("STEP 6: build EMA wrapper around model")
+    # ============ UNFOLDED Trainer.__init__ + Trainer.load ============
 
-    # ============================================================
-    # STEP 7 (TODO): load the checkpoint.
-    # See solver.py:77-86 for what Trainer.load does. Note the path
-    # convention: results_folder gets `_{seq_length}` appended.
-    #
-    # Hint:
-    #   ckpt_dir = Path(config['solver']['results_folder'] + f"_{model.seq_length}")
-    #   ckpt_path = ckpt_dir / f"checkpoint-{milestone}.pt"
-    #   if not ckpt_path.exists():
-    #       raise FileNotFoundError(f"no checkpoint at {ckpt_path} — train first")
-    #   data = torch.load(str(ckpt_path), map_location=device)
-    #   model.load_state_dict(data['model'])
-    #   ema.load_state_dict(data['ema'])
-    # ============================================================
-    raise NotImplementedError("STEP 7: torch.load checkpoint, restore model + ema state_dicts")
+    # Not training, but Trainer.restore samples from `ema.ema_model`
+    # (solver.py:176, 179) — the EMA wrapper has to exist to receive the
+    # EMA weights from the checkpoint.
+    ema_decay = config["solver"]["ema"]["decay"]
+    ema_update_every = config["solver"]["ema"]["update_interval"]
+    ema = EMA(model, beta=ema_decay, update_every=ema_update_every).to(device)
 
-    # ============================================================
-    # STEP 8: read the three test-time sampling params from config
-    # (main.py:80-82). These are paper params from Yuan & Qiao 2024
-    # §B.3 + Table 6.
-    # ============================================================
-    coef = config['dataloader']['test_dataset']['coefficient']
-    stepsize = config['dataloader']['test_dataset']['step_size']
-    sampling_steps = config['dataloader']['test_dataset']['sampling_steps']
-    model_kwargs = {'coef': coef, 'learning_rate': stepsize}
+    ckpt_path = results_folder / f"checkpoint-{milestone}.pt"
+    data = torch.load(str(ckpt_path), map_location=device)
+    model.load_state_dict(data["model"])
+    ema.load_state_dict(data["ema"])
 
-    # ============================================================
-    # STEP 9: per-ratio sweep.
-    # For each ratio: rebuild the cond dataloader (the mask is fixed
-    # at dataset construction time), run the sampling loop, save .npy.
-    # ============================================================
+    # Three test-time sampling params from the YAML (Yuan & Qiao 2024 §B.3 + Table 6).
+    # Constant across ratios, so read once outside the loop.
+    coef = config["dataloader"]["test_dataset"]["coefficient"]
+    stepsize = config["dataloader"]["test_dataset"]["step_size"]
+    sampling_steps = config["dataloader"]["test_dataset"]["sampling_steps"]
+    model_kwargs = {"coef": coef, "learning_rate": stepsize}
+
+    # ============ UNFOLDED Trainer.restore (per ratio) ============
+
+    metrics_all: dict[str, dict[str, float]] = {}
     for r in ratios:
+        # Mask is fixed at dataset construction time, so a fresh dataset+loader
+        # is needed per ratio.
         args.missing_ratio = r
         dataloader, dataset = build_cond_dataloader(config, args)
         window, var_num = dataset.window, dataset.var_num
 
-        # --------------------------------------------------------
-        # ====== UNFOLDED Trainer.restore (solver.py:162-188) =====
-        # --------------------------------------------------------
+        logger.log_info(f"[{run_name}] ratio={r}: begin sampling...")
+        samples_norm = np.empty([0, window, var_num])
+        reals_norm = np.empty([0, window, var_num])
+        masks_bool = np.empty([0, window, var_num], dtype=bool)
 
-        # STEP 10 (TODO): the per-batch sampling loop.
-        # The dataset yields (x, t_m) where t_m is the mask
-        # (1=observed, 0=missing). We feed `target=x*t_m` and
-        # `partial_mask=t_m` to the sampler.
-        #
-        # Hint:
-        #   samples = np.empty([0, window, var_num])
-        #   for x, t_m in dataloader:
-        #       x, t_m = x.to(device), t_m.to(device)
-        #       if sampling_steps == model.num_timesteps:
-        #           sample = ema.ema_model.sample_infill(
-        #               shape=x.shape, target=x * t_m,
-        #               partial_mask=t_m, model_kwargs=model_kwargs,
-        #           )
-        #       else:
-        #           sample = ema.ema_model.fast_sample_infill(
-        #               shape=x.shape, target=x * t_m,
-        #               partial_mask=t_m, model_kwargs=model_kwargs,
-        #               sampling_timesteps=sampling_steps,
-        #           )
-        #       samples = np.row_stack([samples, sample.detach().cpu().numpy()])
-        # --------------------------------------------------------
-        raise NotImplementedError("STEP 10: per-batch sampling loop over the cond dataloader")
+        for x, t_m in dataloader:
+            x, t_m = x.to(device), t_m.to(device)
+            # sample_infill is the full DDPM loop; fast_sample_infill is DDIM —
+            # picked by whether sampling_steps matches the trained num_timesteps.
+            if sampling_steps == model.num_timesteps:
+                sample = ema.ema_model.sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                )
+            else:
+                sample = ema.ema_model.fast_sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                    sampling_timesteps=sampling_steps,
+                )
+            samples_norm = np.row_stack([samples_norm, sample.detach().cpu().numpy()])
+            reals_norm = np.row_stack([reals_norm, x.detach().cpu().numpy()])
+            masks_bool = np.row_stack([masks_bool, t_m.detach().cpu().numpy().astype(bool)])
 
-        # --------------------------------------------------------
-        # STEP 11: rescale [-1,1] → [0,1] when the dataset normalised
-        # to neg_one_to_one (main.py:84-86).
-        # --------------------------------------------------------
-        if dataset.auto_norm:
-            samples = unnormalize_to_zero_to_one(samples)
+        # `dataset.unnormalize` does both [-1,1]→[0,1] and scaler.inverse — same
+        # convention used by forecasting_one. Metrics + plots live in the
+        # dataset's natural units, not the diffusion-model latent scale.
+        samples_orig = dataset.unnormalize(samples_norm)
+        reals_orig = dataset.unnormalize(reals_norm)
 
-        # --------------------------------------------------------
-        # STEP 12: save with a per-ratio tag so different ratios
-        # don't clobber each other.
-        # --------------------------------------------------------
         tag = f"m{int(round(r * 100))}"
-        out_path = os.path.join(save_dir, f"ddpm_infill_{cfg}_{tag}.npy")
-        np.save(out_path, samples)
-        logger.log_info(f"[{cfg}] ratio={r} -> {out_path} (shape={samples.shape})")
+        out_path = os.path.join(save_dir, f"ddpm_infill_{run_name}_{tag}.npy")
+        reals_path = os.path.join(save_dir, f"reals_{run_name}_{tag}.npy")
+        masks_path = os.path.join(save_dir, f"masks_{run_name}_{tag}.npy")
+        np.save(out_path, samples_orig)
+        np.save(reals_path, reals_orig)
+        np.save(masks_path, masks_bool)
+        logger.log_info(
+            f"[{run_name}] ratio={r} -> {out_path} (shape={samples_orig.shape})"
+        )
+
+        # Masked-position (mask==0) MSE/MAE — the standard imputation form.
+        # MSE matches Yuan & Qiao 2024 Table 4; MAE added as the standard companion.
+        target = ~masks_bool
+        diff = samples_orig[target] - reals_orig[target]
+        mse = float((diff ** 2).mean())
+        mae = float(np.abs(diff).mean())
+        metrics_all[tag] = {
+            "missing_ratio": r,
+            "mse": mse,
+            "mae": mae,
+            "n_target_points": int(target.sum()),
+        }
+        logger.log_info(f"[{run_name}] ratio={r}: MSE={mse:.6f}  MAE={mae:.6f}")
+
+        plot_path = os.path.join(save_dir, f"impute_{run_name}_{tag}.png")
+        _plot_imputation(
+            samples_orig, reals_orig, masks_bool,
+            save_path=plot_path,
+            title=f"{run_name}  missing={int(round(r * 100))}%",
+            n_samples=n_plot_samples,
+            n_features=n_plot_features,
+        )
+        logger.log_info(f"[{run_name}] ratio={r} -> {plot_path}")
+
+    metrics_path = os.path.join(save_dir, f"metrics_{run_name}.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_all, f, indent=2)
+    logger.log_info(f"[{run_name}] metrics -> {metrics_path}")
+
+
+def _plot_imputation(samples, reals, masks, *, save_path, title,
+                     n_samples=5, n_features=4):
+    """Tutorial_1.ipynb / plot.py style — per panel: red x at observed
+    positions (mask=1, truth value), blue o at target positions (mask=0,
+    truth value), green line for the full Diffusion-TS imputation."""
+    seq_length = reals.shape[1]
+    n_samples = min(n_samples, reals.shape[0])
+    n_features = min(n_features, reals.shape[2])
+
+    fig, axes = plt.subplots(
+        n_samples, n_features,
+        figsize=(4 * n_features, 2.0 * n_samples),
+        squeeze=False,
+    )
+    t = np.arange(seq_length)
+
+    for s in range(n_samples):
+        for f in range(n_features):
+            ax = axes[s, f]
+            obs_t = t[masks[s, :, f]]
+            tgt_t = t[~masks[s, :, f]]
+            ax.plot(obs_t, reals[s, obs_t, f], "rx", label="Observed")
+            ax.plot(tgt_t, reals[s, tgt_t, f], "bo", mfc="none", label="Target")
+            ax.plot(t, samples[s, :, f], "g-", label="Imputation")
+            if s == 0 and f == 0:
+                ax.legend(loc="best", fontsize=7)
+            if f == 0:
+                ax.set_ylabel(f"sample {s}")
+            if s == 0:
+                ax.set_title(f"feat {f}")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
@@ -233,4 +286,5 @@ if __name__ == "__main__":
         seed=SEED_DEFAULT,
         milestone=MILESTONE_DEFAULT,
         ratios=list(MISSING_RATIOS_DEFAULT),
+        seq_length=SEQ_LENGTH_DEFAULT,
     )
