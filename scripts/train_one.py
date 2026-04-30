@@ -42,6 +42,7 @@ from Utils.io_utils import (
     get_model_parameters_info,
 )
 
+from scripts.utils import get_results_folder
 
 def cycle(dl):
     """Yield batches forever so the step-based training loop never exhausts.
@@ -78,7 +79,7 @@ def build_dataloader(config, args=None):
 def train_one(
     cfg: str,
     gpu: int,
-    seq_length: int | None = None,
+    seq_length: int,
     seed: int = 12345,
     tensorboard: bool = False,
     log_frequency: int = 100,
@@ -107,7 +108,7 @@ def train_one(
 
     # Centralise checkpoints under ./checkpoints/<cfg>_seq_<N>/ — folder name is
     # always self-describing, no matter whether seq_length came from YAML or caller.
-    results_folder = Path("checkpoints") / f"{cfg}_seq_{seq_length}"
+    results_folder = get_results_folder(config, cfg, seq_length)
     config["solver"]["results_folder"] = results_folder
 
     save_dir = Path(output).joinpath(f"{cfg}_seq_{seq_length}")

@@ -13,7 +13,12 @@ Run from the Diffusion-TS directory:
 This module exposes `forecast_one(...)` plus the small helpers it needs. It does
 NOT orchestrate multi-GPU runs — that lives in `forecasting_reproduce.py`.
 
-Output: OUTPUT/<cfg>/ddpm_predict_<cfg>_h{pred_len}.npy
+Outputs (per pred_len L), all under OUTPUT/<cfg>/:
+  ddpm_predict_<cfg>_h{L}.npy   — samples, original units
+  reals_<cfg>_h{L}.npy          — ground truth, original units
+  masks_<cfg>_h{L}.npy          — bool mask (True=observed, False=future)
+  forecast_<cfg>_h{L}.png       — Tutorial_2-style history/GT/prediction plot
+  metrics_<cfg>.json            — {'h{L}': {pred_len, mse, mae, n_target_points}}
 
 READING (the source this script unfolds):
   main.py:54-95              — top-level dispatch
@@ -33,26 +38,32 @@ READING (the source this script unfolds):
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from ema_pytorch import EMA
 
 from engine.logger import Logger
-from Models.interpretable_diffusion.model_utils import unnormalize_to_zero_to_one
 from Utils.io_utils import (
     load_yaml_config,
     seed_everything,
     instantiate_from_config,
 )
 
+from scripts.utils import get_results_folder
 
 PRED_LENS_DEFAULT: tuple[int, ...] = (24,)
 MILESTONE_DEFAULT = 10
 SEED_DEFAULT = 12345
+SEQ_LENGTH_DEFAULT = 24
 
 
 def build_cond_dataloader(config: dict, args: SimpleNamespace):
@@ -88,8 +99,11 @@ def forecast_one(
     gpu: int,
     seed: int,
     milestone: int,
-    pred_lens: list[int],
+    pred_lenth: list[int],
+    seq_length: int,
     output: str = "OUTPUT",
+    n_plot_samples: int = 5,
+    n_plot_features: int = 4,
 ) -> None:
     """Forecasting pipeline, fully unfolded. One model load, then one
     sampling sweep per prediction horizon."""
@@ -109,7 +123,7 @@ def forecast_one(
         gpu=gpu,
         mode="predict",
         missing_ratio=0.0,
-        pred_len=0,  # overwritten per-horizon below
+        pred_len=0,  # overwritten per-horizon in the sweep below
     )
 
     # ============================================================
@@ -119,9 +133,21 @@ def forecast_one(
     torch.cuda.set_device(gpu)
 
     # ============================================================
-    # STEP 3: load YAML config (main.py:63).
+    # STEP 3: load YAML config (main.py:63), then propagate seq_length
+    # like train_one.py:99-107 — model arch + dataloader windows must
+    # match the checkpoint trained at this seq_length, otherwise the
+    # state_dict load below silently mismatches conv kernels.
     # ============================================================
     config = load_yaml_config(config_file)
+    config["model"]["params"]["seq_length"] = seq_length
+    config["dataloader"]["test_dataset"]["params"]["window"] = seq_length
+    if "train_dataset" in config["dataloader"]:
+        config["dataloader"]["train_dataset"]["params"]["window"] = seq_length
+    config["model"]["params"].pop("kernel_size", None)
+    config["model"]["params"].pop("padding_size", None)
+
+    results_folder = get_results_folder(config, cfg, seq_length)
+    config["solver"]["results_folder"] = results_folder
 
     # ============================================================
     # STEP 4: Logger.
@@ -145,7 +171,9 @@ def forecast_one(
     #   ema_update_every = config['solver']['ema']['update_interval']
     #   ema = EMA(model, beta=ema_decay, update_every=ema_update_every).to(device)
     # ============================================================
-    raise NotImplementedError("STEP 6: build EMA wrapper around model")
+    ema_decay = config["solver"]["ema"]["decay"]
+    ema_update_every = config["solver"]["ema"]["update_interval"]
+    ema = EMA(model, beta=ema_decay, update_every=ema_update_every).to(device)
 
     # ============================================================
     # STEP 7 (TODO): load the checkpoint.
@@ -160,12 +188,18 @@ def forecast_one(
     #   model.load_state_dict(data['model'])
     #   ema.load_state_dict(data['ema'])
     # ============================================================
-    raise NotImplementedError(
-        "STEP 7: torch.load checkpoint, restore model + ema state_dicts"
+    ckpt_dir = results_folder
+    ckpt_path = ckpt_dir / f"checkpoint-{milestone}.pt"
+    data = torch.load(
+        str(ckpt_path),
+        map_location=device,
     )
+    model.load_state_dict(data["model"])
+    ema.load_state_dict(data["ema"])
 
     # ============================================================
     # STEP 8: read the three test-time sampling params (main.py:80-82).
+    # These don't change per-horizon, so read once.
     # ============================================================
     coef = config["dataloader"]["test_dataset"]["coefficient"]
     stepsize = config["dataloader"]["test_dataset"]["step_size"]
@@ -175,9 +209,11 @@ def forecast_one(
     # ============================================================
     # STEP 9: per-horizon sweep.
     # For each pred_len: rebuild the cond dataloader (mask is set at
-    # dataset construction time), run the sampling loop, save .npy.
+    # dataset construction time), run the sampling loop, save .npy +
+    # metrics + plot.
     # ============================================================
-    for L in pred_lens:
+    metrics_all: dict[str, dict[str, float]] = {}
+    for L in pred_lenth:
         args.pred_len = L
         dataloader, dataset = build_cond_dataloader(config, args)
         window, var_num = dataset.window, dataset.var_num
@@ -185,47 +221,133 @@ def forecast_one(
         # --------------------------------------------------------
         # ====== UNFOLDED Trainer.restore (solver.py:162-188) =====
         # --------------------------------------------------------
+        logger.log_info(f"[{cfg}] pred_len={L}: begin sampling...")
+        samples_norm = np.empty([0, window, var_num])
+        reals_norm = np.empty([0, window, var_num])
+        masks_bool = np.empty([0, window, var_num], dtype=bool)
 
-        # STEP 10 (TODO): per-batch sampling loop.
-        # Same call signature as imputation — `sample_infill` doesn't
-        # care whether the mask came from a missing-ratio (random) or
-        # a predict_length (suffix). Only the mask shape differs.
-        #
-        # Hint:
-        #   samples = np.empty([0, window, var_num])
-        #   for x, t_m in dataloader:
-        #       x, t_m = x.to(device), t_m.to(device)
-        #       if sampling_steps == model.num_timesteps:
-        #           sample = ema.ema_model.sample_infill(
-        #               shape=x.shape, target=x * t_m,
-        #               partial_mask=t_m, model_kwargs=model_kwargs,
-        #           )
-        #       else:
-        #           sample = ema.ema_model.fast_sample_infill(
-        #               shape=x.shape, target=x * t_m,
-        #               partial_mask=t_m, model_kwargs=model_kwargs,
-        #               sampling_timesteps=sampling_steps,
-        #           )
-        #       samples = np.row_stack([samples, sample.detach().cpu().numpy()])
-        # --------------------------------------------------------
-        raise NotImplementedError(
-            "STEP 10: per-batch sampling loop over the cond dataloader"
-        )
-
-        # --------------------------------------------------------
-        # STEP 11: rescale [-1,1] → [0,1] when the dataset normalised
-        # to neg_one_to_one (main.py:84-86).
-        # --------------------------------------------------------
-        if dataset.auto_norm:
-            samples = unnormalize_to_zero_to_one(samples)
+        for x, t_m in dataloader:
+            x, t_m = x.to(device), t_m.to(device)
+            if sampling_steps == model.num_timesteps:
+                sample = ema.ema_model.sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                )
+            else:
+                sample = ema.ema_model.fast_sample_infill(
+                    shape=x.shape,
+                    target=x * t_m,
+                    partial_mask=t_m,
+                    model_kwargs=model_kwargs,
+                    sampling_timesteps=sampling_steps,
+                )
+            samples_norm = np.row_stack([samples_norm, sample.detach().cpu().numpy()])
+            reals_norm = np.row_stack([reals_norm, x.detach().cpu().numpy()])
+            masks_bool = np.row_stack([masks_bool, t_m.detach().cpu().numpy().astype(bool)])
 
         # --------------------------------------------------------
-        # STEP 12: save with a per-horizon tag.
+        # STEP 11: invert the dataset's normalisation back to original
+        # units (matches Tutorial_2.ipynb cell 8: scaler.inverse(unnorm(...))).
+        # `dataset.unnormalize` does both [-1,1]→[0,1] and scaler.inverse.
+        # --------------------------------------------------------
+        samples_orig = dataset.unnormalize(samples_norm)
+        reals_orig = dataset.unnormalize(reals_norm)
+
+        # --------------------------------------------------------
+        # STEP 12: save samples / reals / masks with per-horizon tag.
         # --------------------------------------------------------
         tag = f"h{L}"
         out_path = os.path.join(save_dir, f"ddpm_predict_{cfg}_{tag}.npy")
-        np.save(out_path, samples)
-        logger.log_info(f"[{cfg}] pred_len={L} -> {out_path} (shape={samples.shape})")
+        reals_path = os.path.join(save_dir, f"reals_{cfg}_{tag}.npy")
+        masks_path = os.path.join(save_dir, f"masks_{cfg}_{tag}.npy")
+        np.save(out_path, samples_orig)
+        np.save(reals_path, reals_orig)
+        np.save(masks_path, masks_bool)
+        logger.log_info(
+            f"[{cfg}] pred_len={L} -> {out_path} (shape={samples_orig.shape})"
+        )
+
+        # --------------------------------------------------------
+        # STEP 13: metrics on the future tail (mask==0).
+        # Mirrors Tutorial_2.ipynb: mse = mean_squared_error(sample[~mask], real[~mask]).
+        # MSE is what the paper reports (Table 5 + §C.3); MAE added for
+        # convenience as it's the other standard forecasting metric.
+        # --------------------------------------------------------
+        target = ~masks_bool
+        diff = samples_orig[target] - reals_orig[target]
+        mse = float((diff ** 2).mean())
+        mae = float(np.abs(diff).mean())
+        metrics_all[tag] = {"pred_len": L, "mse": mse, "mae": mae,
+                            "n_target_points": int(target.sum())}
+        logger.log_info(f"[{cfg}] pred_len={L}: MSE={mse:.6f}  MAE={mae:.6f}")
+
+        # --------------------------------------------------------
+        # STEP 14: Tutorial_2-style plot — history (cyan) + ground-truth
+        # tail (green) + prediction tail (red), first N samples × first
+        # M features.
+        # --------------------------------------------------------
+        plot_path = os.path.join(save_dir, f"forecast_{cfg}_{tag}.png")
+        _plot_forecast(
+            samples_orig, reals_orig, pred_len=L,
+            save_path=plot_path,
+            title=f"{cfg}  pred_len={L}",
+            n_samples=n_plot_samples,
+            n_features=n_plot_features,
+        )
+        logger.log_info(f"[{cfg}] pred_len={L} -> {plot_path}")
+
+    # ============================================================
+    # STEP 15: dump the full metric table once.
+    # ============================================================
+    metrics_path = os.path.join(save_dir, f"metrics_{cfg}.json")
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_all, f, indent=2)
+    logger.log_info(f"[{cfg}] metrics -> {metrics_path}")
+
+
+def _plot_forecast(samples, reals, *, pred_len, save_path, title,
+                    n_samples=5, n_features=4):
+    """Tutorial_2.ipynb cell 9 style: per panel, plot history (cyan) up
+    to t = window-pred_len, then ground-truth tail (green) and prediction
+    tail (red) overlapping by one point so the lines visually connect.
+
+    Plots a (n_samples × n_features) grid from the first samples/features
+    of `samples` and `reals` (already in original units)."""
+    seq_length = reals.shape[1]
+    history_end = seq_length - pred_len  # first index of the future tail
+
+    n_samples = min(n_samples, reals.shape[0])
+    n_features = min(n_features, reals.shape[2])
+
+    fig, axes = plt.subplots(
+        n_samples, n_features,
+        figsize=(4 * n_features, 2.0 * n_samples),
+        squeeze=False,
+    )
+    t = np.arange(seq_length)
+    hist_t = t[:history_end]
+    fut_t = t[history_end - 1:]  # overlap by 1 so the line connects
+
+    for s in range(n_samples):
+        for f in range(n_features):
+            ax = axes[s, f]
+            ax.plot(hist_t, reals[s, :history_end, f], color="c", label="History")
+            ax.plot(fut_t, reals[s, history_end - 1:, f], color="g", label="Ground Truth")
+            ax.plot(fut_t, samples[s, history_end - 1:, f], color="r", label="Prediction")
+            ax.axvline(history_end - 1, color="grey", linewidth=0.5, linestyle="--")
+            if s == 0 and f == 0:
+                ax.legend(loc="best", fontsize=7)
+            if f == 0:
+                ax.set_ylabel(f"sample {s}")
+            if s == 0:
+                ax.set_title(f"feat {f}")
+
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=120)
+    plt.close(fig)
 
 
 if __name__ == "__main__":
@@ -234,5 +356,6 @@ if __name__ == "__main__":
         gpu=0,
         seed=SEED_DEFAULT,
         milestone=MILESTONE_DEFAULT,
-        pred_lens=list(PRED_LENS_DEFAULT),
+        pred_lenth=list(PRED_LENS_DEFAULT),
+        seq_length=SEQ_LENGTH_DEFAULT,
     )
