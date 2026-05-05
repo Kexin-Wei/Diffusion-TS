@@ -96,16 +96,17 @@ class PhysiBaseDataset(Dataset):
         directory = Path(data_root) / MODALITY_DIRS[self.modality]
         if not directory.exists():
             raise FileNotFoundError(f"Missing Physi directory: {directory}")
-        paths = sorted(directory.glob("*.npy"))
+        meta = np.load(directory / "_meta.npy", allow_pickle=True).item()
+        if meta.get("n_features", self.var_num) != self.var_num:
+            raise ValueError(
+                f"Expected {self.var_num} features for {self.modality}, "
+                f"but _meta.npy reports {meta.get('n_features')}"
+            )
+        paths = sorted(directory / fn for fn in meta["filenames"])
         if max_files is not None:
             paths = paths[:max_files]
-        files = []
-        for path in paths:
-            record = self._load_record(path)
-            if record["data"].shape[-1] != self.var_num:
-                raise ValueError(f"{path} has shape {record['data'].shape}, expected {self.var_num} features")
-            files.append({"path": path, "length": int(record.get("length", record["data"].shape[0]))})
-        return files
+        lengths = meta["lengths"]
+        return [{"path": p, "length": int(lengths[i])} for i, p in enumerate(paths)]
 
     def _select_split(self, files, proportion, seed):
         if proportion >= 1.0:
@@ -189,14 +190,26 @@ class PhysiBaseDataset(Dataset):
 class PhysiCGMDataset(PhysiBaseDataset):
     modality = "cgm"
 
+    def __init__(self, *args, window=256, **kwargs):
+        super().__init__(*args, window=window, **kwargs)
+
 
 class PhysiECGDataset(PhysiBaseDataset):
     modality = "ecg"
+
+    def __init__(self, *args, window=128, **kwargs):
+        super().__init__(*args, window=window, **kwargs)
 
 
 class PhysiEEGDataset(PhysiBaseDataset):
     modality = "eeg"
 
+    def __init__(self, *args, window=256, **kwargs):
+        super().__init__(*args, window=window, **kwargs)
+
 
 class PhysiEMGDataset(PhysiBaseDataset):
     modality = "emg"
+
+    def __init__(self, *args, window=256, **kwargs):
+        super().__init__(*args, window=window, **kwargs)
